@@ -5,6 +5,7 @@ struct UfsSmmuPlan {
   unsigned slot = 0xffffffffU, bank = 0, pages = 0;
   uint32_t smr = 0, s2cr = 0;
   bool reuse = false;
+  bool firmware = false;   // the firmware's own pass-through, taken as it is (UFS_SMMU_FIRMWARE_BYPASS)
   const char *error = nullptr;
 };
 // ARM IHI 0062D.c sections 1.6 and 3.7: VA64=0 still rejects inputs above
@@ -76,6 +77,35 @@ static UfsSmmuPlan planUfsSmmuBank(uint16_t stream, uint64_t dma, uint64_t bytes
   return p;
 }
 
+#if defined(UFS_SMMU_FIRMWARE_BYPASS)
+// The firmware's own pass-through: exactly one stream-match group for the stream, without a mask, S2CR TRANSLATE to a context
+// bank whose stage 1 is off (SCTLR.M=0) with VA64 set, the path the firmware's UFS DMA used. It is taken as it is and nothing
+// is written. pipa (SM8250, 2026-10-23): UEFI leaves 0xe0 on bank 3 and 0x4e0 on bank 2 this way (SCTLR 0x009f00e0,
+// CBAR 0x1f000, CBA2R 1). `checked` is the bank planner's refusal, which has already checked the geometry and DMA width.
+template <class Read>
+static UfsSmmuPlan planUfsSmmuFirmware(uint16_t stream, Read read, const UfsSmmuPlan &checked)
+{
+  UfsSmmuPlan p;
+  p.pages = checked.pages;
+  unsigned count = read(0x20) & 255, banks = read(0x24) & 255, matches = 0;
+  if (count > 128) count = 128;
+  for (unsigned i = 0; i < count; ++i) {
+    uint32_t smr = read(0x800 + 4 * i);
+    if (!(smr & 0x80000000U) || ((smr ^ stream) & 0xffff & ~((smr >> 16) & 0x7fff)) != 0) continue;
+    if (++matches > 1 || (smr & 0x7fff0000U)) {p.error = "conflicting UFS stream mapping"; return p;}
+    p.slot = i; p.smr = smr; p.s2cr = read(0xc00 + 4 * i);
+  }
+  if (!matches) {p.error = "no firmware UFS stream mapping"; return p;}
+  p.bank = p.s2cr & 255;
+  if (((p.s2cr >> 16) & 3) != 0 || p.bank >= banks) {p.error = "firmware UFS stream not translated"; return p;}
+  if ((read((p.pages + p.bank) * 4096) & 1) || !(read(0x1800 + 4 * p.bank) & 1)) {
+    p.error = "firmware UFS context bank not a 64-bit pass-through"; return p;
+  }
+  p.firmware = true;
+  return p;
+}
+#endif
+
 // The UFS stream's context bank: the top bank first. A stream mapping left behind by an earlier run (or by another OS that used the SMMU before a
 // warm reset) can still point another stream at that bank; rather than refuse to boot, the next banks down are tried, each held to the same checks
 // (no other valid stream maps it, translation off). Any other refusal (a conflicting mapping of our own stream, no free group, unsupported geometry)
@@ -86,6 +116,12 @@ static UfsSmmuPlan planUfsSmmu(uint16_t stream, uint64_t dma, uint64_t bytes, Re
   enum {kBankAttempts = 8};
   UfsSmmuPlan first = planUfsSmmuBank(stream, dma, bytes, read, 0);
   if (!first.error) return first;
+#if defined(UFS_SMMU_FIRMWARE_BYPASS)
+  if (!__builtin_strcmp(first.error, "conflicting UFS stream mapping")) {
+    UfsSmmuPlan firmware = planUfsSmmuFirmware(stream, read, first);
+    if (!firmware.error) return firmware;
+  }
+#endif
   // "conflicting" is retried too: our own stream may already sit on a lower bank from an earlier run that had to fall back.
   auto retryable = [](const char *e) {
     return !__builtin_strcmp(e, "reserved context bank already used") || !__builtin_strcmp(e, "reserved context bank not bypass") ||
@@ -108,6 +144,13 @@ static const char *configureUfsSmmu(const UfsSmmuPlan &p, uint16_t stream, Read 
 {
   if (p.error) return p.error;
   unsigned cb = (p.pages + p.bank) * 4096;
+  if (p.firmware) {
+    // Nothing to write: only check that the firmware's mapping is still the one planned.
+    if (read(0x800 + 4 * p.slot) != p.smr || read(0xc00 + 4 * p.slot) != p.s2cr || (read(cb) & 1) ||
+        !(read(0x1800 + 4 * p.bank) & 1))
+      return "firmware SMMU pass-through changed";
+    return nullptr;
+  }
   if (!p.reuse) write(cb, 0);
   if (read(cb) != 0) return "SMMU bypass disable readback";
   // Set VA64 before exposing a newly allocated stream. Repair an exclusive

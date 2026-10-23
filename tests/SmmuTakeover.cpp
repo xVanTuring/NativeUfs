@@ -86,5 +86,29 @@ int main()
   reset(); p=plan(); drop=0xffffffffU; assert(!configure());
   r[(0x1800+4*p.bank)/4]=0x10001; p=plan(); assert(p.error);
   writes.clear(); assert(configure() && writes.empty());
+#if defined(UFS_SMMU_FIRMWARE_BYPASS)
+  // pipa (SM8250) as UEFI leaves it (survey 2026-10-23): 87 groups, 74 banks, 0xe0 on bank 3 and 0x4e0 on bank 2, both with stage 1
+  // off and VA64. The firmware mapping is taken without a write; any other shape of it is still refused.
+  {
+    std::vector<uint32_t> k(0x100000/4);
+    auto kread=[&](unsigned at){return k.at(at/4);};
+    std::vector<unsigned> kwrites;
+    auto kwrite=[&](unsigned at,uint32_t value){kwrites.push_back(at); k.at(at/4)=value;};
+    auto kreset=[&] {
+      std::fill(k.begin(),k.end(),0); k[0x20/4]=0x4c017e57; k[0x24/4]=0x6000004a; k[0x28/4]=0x5111;
+      for(unsigned bank : {2U,3U}) {k[(0x1000+4*bank)/4]=0x1f000; k[(0x1800+4*bank)/4]=1; k[(128+bank)*4096/4]=0x009f00e0;}
+      k[(0x800+4*3)/4]=0x800000e0; k[(0xc00+4*3)/4]=3; k[(0x800+4*2)/4]=0x800004e0; k[(0xc00+4*2)/4]=2;
+    };
+    auto kplan=[&] {return planUfsSmmu(0xe0,0x1ffc20000ULL,0x22000,kread);};
+    kreset(); auto f=kplan(); assert(!f.error && f.firmware && f.slot==3 && f.bank==3 && f.pages==128);
+    assert(!configureUfsSmmu(f,0xe0,kread,kwrite) && kwrites.empty());
+    k[(128+3)*4096/4]|=1; assert(configureUfsSmmu(f,0xe0,kread,kwrite) && kwrites.empty()); // translation turned on since
+    kreset(); k[(128+3)*4096/4]|=1; assert(kplan().error);                     // stage 1 on: not a pass-through
+    kreset(); k[(0x1800+4*3)/4]=0; assert(kplan().error);                      // VA64 off
+    kreset(); k[(0x800+4*5)/4]=0x800000e0; k[(0xc00+4*5)/4]=3; assert(kplan().error); // two groups for the stream
+    kreset(); k[(0x800+4*3)/4]=0x800100e0; assert(kplan().error);              // masked group
+    kreset(); k[(0xc00+4*3)/4]=0x10000; assert(kplan().error);                 // S2CR bypass, not TRANSLATE
+  }
+#endif
   puts("PASS: SMMU geometry/conflicts, VA64 high-DMA regression, full-range width limits, ordered configuration, reuse/repair and blocked-write refusal");
 }

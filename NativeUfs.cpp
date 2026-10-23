@@ -77,6 +77,7 @@ class NativeUfs : public IOService {
   void dumpFirmwareList (void);
   void inspectSmmu (void);
   void inspectContextBanks (void);
+  void survey (void);
   bool startRoot (IOService *provider);
   bool startRootUnverified (IOService *provider);
   static bool waitSet (uintptr_t base, unsigned offset, uint32_t mask, unsigned loops);
@@ -135,6 +136,8 @@ IOService *NativeUfs::probe (IOService *provider, SInt32 *score)
   bool match = false;
 #if defined(NATIVE_UFS_SM6225)
   const char *compatible = "qcom,ufshc";
+#elif defined(NATIVE_UFS_SM8250)
+  const char *compatible = "qcom,sm8250-ufshc";
 #else
   const char *compatible = "qcom,sm8550-ufshc";
 #endif
@@ -805,6 +808,92 @@ void NativeUfs::inspectContextBanks (void)
          read32 (smmu, 0x1000), read32 (smmu, 0x1004), numCb - 1, read32 (smmu, 0x1000 + 4 * (numCb - 1)),
          read32 (cb0, 0), read32 (cb1, 0), read32 (cbLast, 0),
          read32 (smmu, 0x1800), read32 (smmu, 0x1804));
+}
+
+// Read-only survey of a new board (native-ufs-probe=16): what probes 2, 7 and 8 report one per boot, written to the kernel
+// log in one pass for a board whose log is the message buffer (pipa: the ramoops zone), with both UFS stream IDs and what
+// the SMMU planner would choose. The controller is read only while its GDSC and bus clocks are on. Nothing is written;
+// start() then runs the probe 10 read check.
+void NativeUfs::survey (void)
+{
+  OSSharedPtr<IOMemoryMap> gccMap, hcMap, smmuMap;
+  uintptr_t gcc = mapPhys (GCC_BASE + GCC_UFS_BLOCK, 0x1000, gccMap);
+  uintptr_t smmu = mapPhys (APPS_SMMU_BASE, APPS_SMMU_SIZE, smmuMap);
+  if (!gcc || !smmu) {
+    panic ("NATIVE_UFS survey: map failed gcc=%p smmu=%p", (void *) gcc, (void *) smmu);
+  }
+  auto clock = [gcc](unsigned reg) { return read32 (gcc, reg - GCC_UFS_BLOCK); };
+  uint32_t gdsc = clock (GCC_UFS_PHY_GDSCR), axi = clock (GCC_UFS_PHY_AXI_ENABLE), ahb = clock (GCC_UFS_PHY_AHB_ENABLE);
+  IOLog ("NATIVE_UFS survey gcc gdsc=%08x axi=%08x ahb=%08x unipro=%08x ice=%08x aux=%08x txsym0=%08x rxsym0=%08x\n",
+         gdsc, axi, ahb, clock (GCC_UFS_PHY_UNIPRO_CORE_ENABLE), clock (GCC_UFS_PHY_ICE_CORE_ENABLE),
+         clock (GCC_UFS_PHY_PHY_AUX_ENABLE), clock (GCC_UFS_PHY_TX_SYMBOL0_ENABLE), clock (GCC_UFS_PHY_RX_SYMBOL0_ENABLE));
+#if defined(GCC_UFS_PHY_RX_SYMBOL1_ENABLE) && defined(GCC_AGGRE_UFS_PHY_AXI_ENABLE)
+  IOLog ("NATIVE_UFS survey gcc rxsym1=%08x aggre=%08x\n",
+         clock (GCC_UFS_PHY_RX_SYMBOL1_ENABLE), clock (GCC_AGGRE_UFS_PHY_AXI_ENABLE));
+#endif
+  // The same gate as inspect(): GDSCR bit31 PWR_ON, the AXI branch running and both bus branches enabled.
+  bool powered = (gdsc & 0x80000000U) != 0;
+  bool busClocks = !(axi & 0x80000000U) && (ahb & 0x1U) && (axi & 0x1U);
+  uintptr_t hc = powered && busClocks ? mapPhys (UFS_HC_BASE, UFS_HC_SIZE, hcMap) : 0;
+  if (hc) {
+    IOLog ("NATIVE_UFS survey hc cap=%08x ver=%08x ahit=%08x is=%08x ie=%08x hcs=%08x hce=%08x\n",
+           read32 (hc, 0x00), read32 (hc, 0x08), read32 (hc, 0x18), read32 (hc, 0x20), read32 (hc, 0x24),
+           read32 (hc, 0x30), read32 (hc, 0x34));
+    IOLog ("NATIVE_UFS survey hc utrlba=%08x%08x db=%08x rsr=%08x tmdb=%08x tmrsr=%08x uicerr=%08x %08x %08x %08x %08x\n",
+           read32 (hc, 0x54), read32 (hc, 0x50), read32 (hc, 0x58), read32 (hc, 0x60), read32 (hc, 0x78),
+           read32 (hc, 0x80), read32 (hc, 0x38), read32 (hc, 0x3c), read32 (hc, 0x40), read32 (hc, 0x44), read32 (hc, 0x48));
+  } else {
+    IOLog ("NATIVE_UFS survey hc not read: gdsc %s, bus clocks %s\n", powered ? "on" : "off", busClocks ? "on" : "off");
+  }
+  // sCR0 bit0 CLIENTPD (SMMU off, every stream bypasses), bit10 USFCFG (a stream no SMR matches faults rather than bypasses).
+  uint32_t scr0 = read32 (smmu, 0x00), idr0 = read32 (smmu, 0x20), idr1 = read32 (smmu, 0x24);
+  unsigned count = idr0 & 0xff, banks = idr1 & 0xff, pages = 1U << (((idr1 >> 28) & 7) + 1);
+  IOLog ("NATIVE_UFS survey smmu scr0=%08x idr0=%08x idr1=%08x idr2=%08x gfsr=%08x nsmr=%u ncb=%u pages=%u\n",
+         scr0, idr0, idr1, read32 (smmu, 0x28), read32 (smmu, 0x48), count, banks, pages);
+  if (count > 128) {
+    count = 128;
+  }
+  bool geometry = banks && banks <= 128 && pages <= 128 && (pages + banks) * 0x1000 <= APPS_SMMU_SIZE;
+  unsigned valid = 0, types[4] = { 0, 0, 0, 0 };
+  for (unsigned index = 0; index < count; index++) {
+    if (read32 (smmu, 0x800 + 4 * index) & 0x80000000U) {
+      valid++;
+      types[(read32 (smmu, 0xc00 + 4 * index) >> 16) & 3]++;
+    }
+  }
+  IOLog ("NATIVE_UFS survey smmu valid=%u translate=%u bypass=%u fault=%u\n", valid, types[0], types[1], types[2]);
+#if defined(UFS_STREAM_ALT)
+  static const uint16_t streams[] = { UFS_STREAM, UFS_STREAM_ALT };
+#else
+  static const uint16_t streams[] = { UFS_STREAM };
+#endif
+  for (uint16_t stream : streams) {
+    unsigned found = 0;
+    for (unsigned index = 0; index < count; index++) {
+      uint32_t smr = read32 (smmu, 0x800 + 4 * index), s2cr = read32 (smmu, 0xc00 + 4 * index);
+      uint32_t mask = (smr >> 16) & 0x7fff;
+      if (!(smr & 0x80000000U) || (((smr ^ stream) & 0x7fffU) & ~mask) != 0) {
+        continue;
+      }
+      found++;
+      unsigned bank = s2cr & 0xff;
+      if (((s2cr >> 16) & 3) == 0 && geometry && bank < banks) {
+        IOLog ("NATIVE_UFS survey smmu sid %x: smr[%u]=%08x s2cr=%08x cbar=%08x cba2r=%08x sctlr=%08x\n", stream, index, smr,
+               s2cr, read32 (smmu, 0x1000 + 4 * bank), read32 (smmu, 0x1800 + 4 * bank),
+               read32 (smmu + (pages + bank) * 0x1000, 0));
+      } else {
+        IOLog ("NATIVE_UFS survey smmu sid %x: smr[%u]=%08x s2cr=%08x\n", stream, index, smr, s2cr);
+      }
+    }
+    if (!found) {
+      IOLog ("NATIVE_UFS survey smmu sid %x: no stream mapping (unmatched streams %s)\n", stream,
+             (scr0 & 1) ? "bypass: SMMU off" : (scr0 & (1U << 10)) ? "fault" : "bypass");
+    }
+  }
+  // What hostBringUp's planner would do with a 1 MiB buffer at the start of DRAM (it is given the real buffer then).
+  UfsSmmuPlan plan = planUfsSmmu (UFS_STREAM, 0x80000000ULL, 0x100000ULL, [smmu](unsigned offset) { return read32 (smmu, offset); });
+  IOLog ("NATIVE_UFS survey smmu plan sid %x: slot=%u bank=%u reuse=%u firmware=%u %s\n", UFS_STREAM, plan.slot, plan.bank,
+         plan.reuse ? 1U : 0U, plan.firmware ? 1U : 0U, plan.error ? plan.error : "ok");
 }
 
 // ======================================================================================
@@ -1865,6 +1954,12 @@ bool NativeUfs::start (IOService *provider)
   }
   if ((probe >= 3 && probe <= 5) || probe == 9) {
     adoptAndRead (probe);
+  }
+  if (probe == 16) {
+    survey ();
+    // The board's log (pipa: a thread copying the message buffer every 100 ms) takes the survey before the bring-up.
+    IOSleep (300);
+    probe = 10;
   }
   if (probe == 10) {
     // Read-only check before anything is flashed: LUN 0 GPT -> "userdata" -> its first block.

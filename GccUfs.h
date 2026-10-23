@@ -32,6 +32,39 @@
 // No separate UFS PHY GDSC in the SM6115 bengal GCC driver; the host GDSC is
 // the power domain. The inspection path reads the same register for the log.
 #define GCC_UFS_MEM_PHY_GDSCR         GCC_UFS_PHY_GDSCR
+#elif defined(NATIVE_UFS_SM8250)
+// SM8250 (kona): pipa live device tree (qcom,gcc@100000 "qcom,gcc-kona", ufshc@1d84000, apps-smmu@15000000 of 1 MiB)
+// and gcc-sm8250.c.
+#define GCC_BASE                      0x00100000ULL
+#define GCC_UFS_BLOCK                 0x77000
+#define GCC_UFS_MEM_PHY_BLOCK         0x77000
+#define UFS_HC_BASE                   0x01d84000ULL
+#define UFS_HC_SIZE                   0x3000ULL
+#define APPS_SMMU_BASE                0x15000000ULL
+#define APPS_SMMU_SIZE                0x100000ULL
+// Linux sm8250.dtsi: ufshc@1d84000 iommus = <&apps_smmu 0x0e0 0>, <&apps_smmu 0x4e0 0>. The pipa tree names no UFS
+// stream (its kernel leaves the UFS outside the SMMU); the second ID is surveyed too (native-ufs-probe=16).
+#define UFS_STREAM                    0x0e0
+#define UFS_STREAM_ALT                0x4e0
+// UEFI leaves both streams on context banks with stage 1 off (survey 2026-10-23); NativeUfs keeps that mapping as it is
+// (SmmuTakeover.h planUfsSmmuFirmware) instead of mapping its own bank.
+#define UFS_SMMU_FIRMWARE_BYPASS      1
+// Raw userdata partition of this tablet (sda34 on UFS LUN 0), from its GPT.
+#define UFS_USERDATA_FIRST            0x293000ULL
+#define UFS_USERDATA_LAST             0x1d387faULL
+
+#define GCC_UFS_PHY_GDSCR             0x77004
+#define GCC_UFS_PHY_AXI_ENABLE        0x77010
+#define GCC_UFS_PHY_AHB_ENABLE        0x77018
+#define GCC_UFS_PHY_TX_SYMBOL0_ENABLE 0x7701c
+#define GCC_UFS_PHY_RX_SYMBOL0_ENABLE 0x77020
+#define GCC_UFS_PHY_UNIPRO_CORE_ENABLE 0x7705c
+#define GCC_UFS_PHY_ICE_CORE_ENABLE   0x77064
+#define GCC_UFS_PHY_PHY_AUX_ENABLE    0x7709c
+#define GCC_UFS_PHY_RX_SYMBOL1_ENABLE 0x770b8
+#define GCC_AGGRE_UFS_PHY_AXI_ENABLE  0x770cc
+// No UFS PHY GDSC of its own in gcc-sm8250.c (only ufs_card_gdsc and ufs_phy_gdsc); the host GDSC is read in its place.
+#define GCC_UFS_MEM_PHY_GDSCR         GCC_UFS_PHY_GDSCR
 #else
 // SM8550 (sheng): GCC 0x100000, UFS host 0x1d84000, apps SMMU 0x15000000.
 #define GCC_BASE                      0x00100000ULL
