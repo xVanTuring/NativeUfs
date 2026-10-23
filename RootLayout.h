@@ -9,6 +9,15 @@ struct RootWindow {
   uint8_t sha256[32];
 };
 
+// One owner-signed VerifiedRoot envelope in the policy directory (SHNGPOL1). The directory is only a
+// locator; the envelope is authenticated by the key compiled into the kernel before any block is served.
+struct RootPolicy {
+  char name[32];
+  uint64_t offset;   // bytes from the start of the userdata partition
+  uint64_t size;     // bytes
+  uint8_t sha256[32];
+};
+
 struct RootLayout {
   uint64_t userdataFirst, userdataLast;   // 4096-byte LBAs on LUN 0
   uint64_t imageBytes;                    // size of the flashed root image from the manifest (0 when none)
@@ -17,6 +26,9 @@ struct RootLayout {
   uint32_t windows;
   RootWindow window[4];
   uint32_t manifestStatus;                // 0 ok, 1 no manifest magic, 2 bad version/count, 3 hash, 4 bounds, 5 names, 6 overlap, 7 attributes
+  uint32_t policyStatus;                  // 0 ok, 1 no policy block, 2 bad magic/version/count, 3 hash, 4 bounds, 5 names, 6 overlap
+  uint32_t policies;
+  RootPolicy policy[4];
   uint32_t magic0, magic1;                // first 8 bytes of the partition's first block
   uint32_t ext4Magic;                     // 16 bits at byte 1080 of the partition (0xef53 on Linux ext4)
   uint32_t ext4Blocks;                    // s_blocks_count_lo at byte 1028
@@ -211,9 +223,75 @@ static bool findRootLayout (RootLayout *layout, const char **why)
       }
     }
   }
+  layout->policyStatus = 1;
+  layout->policies = 0;
+  gRootDiagnostic.stage = "root policy directory";
+  // The second block (offset 4096) is free: the windows start at 1 MiB. A missing block is normal for an image
+  // built without --root-policy.
+  if (hostRead4k (0, layout->userdataFirst + 1, 1, gScratch) != kIOReturnSuccess) {
+    layout->policyStatus = 7;
+  } else if (le32 (gScratch) == 0x474e4853U && le32 (gScratch + 4) == 0x314c4f50U) {   // "SHNGPOL1"
+    uint32_t version = le32 (gScratch + 8), n = le32 (gScratch + 12), entryBytes = le32 (gScratch + 16);
+    layout->policyStatus = 2;
+    if (version == 1 && entryBytes == 88 && n <= 4) {
+      SHA256_CTX context;
+      uint8_t digest[32];
+      SHA256_Init (&context);
+      SHA256_Update (&context, gScratch, 4064);
+      SHA256_Final (digest, &context);
+      layout->policyStatus = 3;
+      if (memcmp (digest, gScratch + 4064, 32) == 0) {
+        uint64_t limit = layout->manifestStatus == 0 ? layout->imageBytes
+                                                     : (layout->userdataLast - layout->userdataFirst + 1) * 4096ULL;
+        bool bounds = true;
+        for (uint32_t index = 0; index < n && bounds; index++) {
+          const uint8_t *entry = gScratch + 24 + 88 * index;
+          uint64_t offset = le64 (entry + 32), size = le64 (entry + 40);
+          uint64_t padded = (size + 4095) & ~4095ULL;
+          unsigned length = 0;
+          while (length < 32 && entry[length] >= 0x20 && entry[length] <= 0x7e) ++length;
+          if (!length || length == 32 || entry[length] != 0) {
+            layout->policyStatus = 5; bounds = false; break;
+          }
+          if ((offset & 4095) || offset < 8192 || !size || padded < size || offset >= limit ||
+              padded > limit - offset || le32 (entry + 48) != 4096 || le32 (entry + 52) != 1) {
+            layout->policyStatus = 4; bounds = false; break;
+          }
+          for (uint32_t prior = 0; prior < index; ++prior) {
+            const RootPolicy &other = layout->policy[prior];
+            if (!strcmp (reinterpret_cast<const char *> (entry), other.name) ||
+                (offset < other.offset + ((other.size + 4095) & ~4095ULL) &&
+                 other.offset < offset + padded)) {
+              layout->policyStatus = 6; bounds = false; break;
+            }
+          }
+          // The envelopes must also stay clear of both manifest blocks and of every window.
+          for (uint32_t window = 0; window < layout->windows && bounds; ++window) {
+            const RootWindow &other = layout->window[window];
+            if (offset < other.offset + ((other.size + 4095) & ~4095ULL) &&
+                other.offset < offset + padded) {
+              layout->policyStatus = 6; bounds = false;
+            }
+          }
+          if (!bounds) break;
+          memcpy (layout->policy[index].name, entry, 32);
+          layout->policy[index].name[31] = 0;
+          layout->policy[index].offset = offset;
+          layout->policy[index].size = size;
+          memcpy (layout->policy[index].sha256, entry + 56, 32);
+        }
+        if (bounds) {
+          layout->policies = n;
+          layout->policyStatus = 0;
+        }
+      }
+    }
+  }
   gRootDiagnostic.magic0 = layout->magic0;
   gRootDiagnostic.magic1 = layout->magic1;
   gRootDiagnostic.manifest = layout->manifestStatus;
   gRootDiagnostic.windows = layout->windows;
+  gRootDiagnostic.policy = layout->policyStatus;
+  gRootDiagnostic.policies = layout->policies;
   return true;
 }

@@ -59,6 +59,15 @@ volatile uint32_t native_ufs_uic_status = 0;
 volatile uint32_t native_ufs_uic_result = 0;
 }
 
+#if defined(NATIVE_UFS_PROBE_ONLY)
+// The block/root publication region is not compiled in a probe-only build; the
+// SMMU path still records the last soft-failure reason for the boot page.
+static void rootDiagnosticFailure (const char *reason)
+{
+  native_ufs_root_failure = reason;
+}
+#endif
+
 class NativeUfs : public IOService {
   OSDeclareDefaultStructors (NativeUfs)
   OSSharedPtr<IOMemoryMap> fMap;
@@ -69,6 +78,7 @@ class NativeUfs : public IOService {
   void inspectSmmu (void);
   void inspectContextBanks (void);
   bool startRoot (IOService *provider);
+  bool startRootUnverified (IOService *provider);
   static bool waitSet (uintptr_t base, unsigned offset, uint32_t mask, unsigned loops);
 public:
   IOService *probe (IOService *provider, SInt32 *score) override;
@@ -123,12 +133,17 @@ IOService *NativeUfs::probe (IOService *provider, SInt32 *score)
   OSData *data = OSDynamicCast (OSData, property);
   OSString *string = OSDynamicCast (OSString, property);
   bool match = false;
+#if defined(NATIVE_UFS_SM6225)
+  const char *compatible = "qcom,ufshc";
+#else
+  const char *compatible = "qcom,sm8550-ufshc";
+#endif
   if (data) {
     const char *text = static_cast<const char *> (data->getBytesNoCopy ());
-    match = text && contains (text, data->getLength (), "qcom,sm8550-ufshc");
+    match = text && contains (text, data->getLength (), compatible);
   } else if (string) {
     const char *text = string->getCStringNoCopy ();
-    match = text && contains (text, string->getLength (), "qcom,sm8550-ufshc");
+    match = text && contains (text, string->getLength (), compatible);
   }
   if (!match) {
     return nullptr;
@@ -169,19 +184,19 @@ static uintptr_t mapPhys (uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMa
 void NativeUfs::inspect (void)
 {
   OSSharedPtr<IOMemoryMap> gccMap, memPhyMap, hcMap;
-  uintptr_t gcc = mapPhys (GCC_BASE + 0x77000, 0x1000, gccMap);
-  uintptr_t memPhy = mapPhys (GCC_BASE + 0x9e000, 0x1000, memPhyMap);
+  uintptr_t gcc = mapPhys (GCC_BASE + GCC_UFS_BLOCK, 0x1000, gccMap);
+  uintptr_t memPhy = mapPhys (GCC_BASE + GCC_UFS_MEM_PHY_BLOCK, 0x1000, memPhyMap);
   if (!gcc || !memPhy) {
     panic ("NATIVE_UFS inspect: GCC map failed gcc=%p memphy=%p", (void *) gcc, (void *) memPhy);
   }
-  uint32_t gdsc = read32 (gcc, GCC_UFS_PHY_GDSCR - 0x77000);
-  uint32_t axi = read32 (gcc, GCC_UFS_PHY_AXI_ENABLE - 0x77000);
-  uint32_t ahb = read32 (gcc, GCC_UFS_PHY_AHB_ENABLE - 0x77000);
-  uint32_t unipro = read32 (gcc, GCC_UFS_PHY_UNIPRO_CORE_ENABLE - 0x77000);
-  uint32_t txs = read32 (gcc, GCC_UFS_PHY_TX_SYMBOL0_ENABLE - 0x77000);
-  uint32_t rxs = read32 (gcc, GCC_UFS_PHY_RX_SYMBOL0_ENABLE - 0x77000);
-  uint32_t aux = read32 (gcc, GCC_UFS_PHY_PHY_AUX_ENABLE - 0x77000);
-  uint32_t memGdsc = read32 (memPhy, 0);
+  uint32_t gdsc = read32 (gcc, GCC_UFS_PHY_GDSCR - GCC_UFS_BLOCK);
+  uint32_t axi = read32 (gcc, GCC_UFS_PHY_AXI_ENABLE - GCC_UFS_BLOCK);
+  uint32_t ahb = read32 (gcc, GCC_UFS_PHY_AHB_ENABLE - GCC_UFS_BLOCK);
+  uint32_t unipro = read32 (gcc, GCC_UFS_PHY_UNIPRO_CORE_ENABLE - GCC_UFS_BLOCK);
+  uint32_t txs = read32 (gcc, GCC_UFS_PHY_TX_SYMBOL0_ENABLE - GCC_UFS_BLOCK);
+  uint32_t rxs = read32 (gcc, GCC_UFS_PHY_RX_SYMBOL0_ENABLE - GCC_UFS_BLOCK);
+  uint32_t aux = read32 (gcc, GCC_UFS_PHY_PHY_AUX_ENABLE - GCC_UFS_BLOCK);
+  uint32_t memGdsc = read32 (memPhy, GCC_UFS_MEM_PHY_GDSCR - GCC_UFS_MEM_PHY_BLOCK);
   // GDSCR bit31 PWR_ON; CBCR bit31 CLK_OFF.
   bool powered = (gdsc & 0x80000000U) != 0;
   // Hardware 2026-10-17: AXI running, AHB enabled but CLK_OFF (bit31). With bit1 (HW gating)
@@ -281,7 +296,7 @@ static void zero32 (void *start, size_t length)
 static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, uint32_t *report,
                               uint64_t dma, uint64_t bytes)
 {
-  uintptr_t smmu = mapPhys (0x15000000ULL, 0xd0000, keep);
+  uintptr_t smmu = mapPhys (APPS_SMMU_BASE, APPS_SMMU_SIZE, keep);
   if (!smmu) {
     panic ("NATIVE_UFS smmu: map failed");
   }
@@ -367,7 +382,7 @@ void NativeUfs::adoptAndRead (unsigned level)
   unsigned stopLoops = 10000;
   while ((read32 (hc, 0x60) & 1) && stopLoops--) IODelay (10);
   if (read32 (hc, 0x60) & 1) panic ("NATIVE_UFS adopt: request list did not stop");
-  smmuBypassStream (0x60, smmuMap, smmuReport, phys, 16384);
+  smmuBypassStream (UFS_STREAM, smmuMap, smmuReport, phys, 16384);
   write32 (hc, 0x50, static_cast<uint32_t> (phys));
   write32 (hc, 0x54, static_cast<uint32_t> (phys >> 32));
   write32 (hc, 0x20, 0xffffffffU);  // clear stale status
@@ -716,7 +731,7 @@ void NativeUfs::dumpFirmwareList (void)
 void NativeUfs::inspectSmmu (void)
 {
   OSSharedPtr<IOMemoryMap> map;
-  uintptr_t smmu = mapPhys (0x15000000ULL, 0x1000, map);
+  uintptr_t smmu = mapPhys (APPS_SMMU_BASE, 0x1000, map);
   if (!smmu) {
     panic ("NATIVE_UFS smmu: map failed");
   }
@@ -735,7 +750,7 @@ void NativeUfs::inspectSmmu (void)
       valid++;
       typeCount[(s2cr >> 16) & 3]++;
       uint32_t mask = (smr >> 16) & 0x7fff;
-      if (match == 0xffff && (((smr ^ 0x60U) & 0x7fffU) & ~mask) == 0) {
+      if (match == 0xffff && (((smr ^ UFS_STREAM) & 0x7fffU) & ~mask) == 0) {
         match = index;
         matchSmr = smr;
         matchS2cr = s2cr;
@@ -755,14 +770,14 @@ void NativeUfs::inspectSmmu (void)
 void NativeUfs::inspectContextBanks (void)
 {
   OSSharedPtr<IOMemoryMap> map;
-  uintptr_t smmu = mapPhys (0x15000000ULL, 0xd0000, map);
+  uintptr_t smmu = mapPhys (APPS_SMMU_BASE, APPS_SMMU_SIZE, map);
   if (!smmu) {
     panic ("NATIVE_UFS cb: map failed");
   }
   uint32_t idr1 = read32 (smmu, 0x24);
   unsigned numCb = idr1 & 0xff;
   unsigned globalPages = 1U << (((idr1 >> 28) & 7) + 1);
-  if (globalPages > 128 || numCb > 128 || (globalPages + numCb) * 0x1000 > 0xd0000) {
+  if (globalPages > 128 || numCb > 128 || (globalPages + numCb) * 0x1000 > APPS_SMMU_SIZE) {
     panic ("NATIVE_UFS cb: unexpected geometry idr1=%08x", idr1);
   }
   unsigned cbarZero = 0, sctlrZero = 0, mSet = 0, bothZero = 0;
@@ -927,7 +942,7 @@ static bool hostBringUp (const char **why)
   uint32_t report[3] = { 0, 0, 0 };
   gRootDiagnostic.stage = "SMMU and request list";
   if (!hostStopQueue (why)) return false;
-  smmuBypassStream (0x60, gHost.smmuMap, report, gHost.phys, kDmaBytes);
+  smmuBypassStream (UFS_STREAM, gHost.smmuMap, report, gHost.phys, kDmaBytes);
   gHost.smmu = gHost.smmuMap->getVirtualAddress ();
   uint32_t idr1 = read32 (gHost.smmu, 0x24);
   gHost.cb = gHost.smmu + ((1U << (((idr1 >> 28) & 7) + 1)) + (report[0] >> 16)) * 4096;
@@ -989,8 +1004,10 @@ static uint32_t be32w (const uint8_t *at)
 }
 
 #include "RootLayout.h"
+#if !defined(NATIVE_UFS_PROBE_ONLY)
 #include "RootWindowRead.h"
 #include "RootPublication.h"
+#endif
 
 }
 
@@ -1203,6 +1220,7 @@ extern "C" unsigned native_ufs_store_gpt_check (void)
 // One read-only window of the root image as a block device: 512-byte sectors on top of 4096-byte
 // UFS blocks, so the unchanged dmg disk images (GPT with 512-byte sectors) parse as they do on
 // the virtio path.
+#if !defined(NATIVE_UFS_PROBE_ONLY)
 class NativeUfsBlock : public IOBlockStorageDevice {
   OSDeclareDefaultStructors (NativeUfsBlock)
   uint64_t absolute = 0;      // byte offset of the window on LUN 0
@@ -1223,7 +1241,7 @@ public:
   bool signedVolumeUuid (char out[37]) const;
 #endif
   const char *windowLabel () const { return label; }
-  bool configure (const char *name, uint64_t absoluteOffset, uint64_t size);
+  bool configure (const char *name, uint64_t absoluteOffset, uint64_t size, bool verify = true);
   bool start (IOService *provider) override;
   void free () override;
   IOReturn doEjectMedia () override { return kIOReturnUnsupported; }
@@ -1283,7 +1301,7 @@ static void rootDiagnosticFailure (const char *reason)
   panic ("%s", gRootDiagnosticText);
 }
 
-bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint64_t size)
+bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint64_t size, bool verify)
 {
   if (!name || !ufsWindowGeometry (absoluteOffset, size)) {
     return false;
@@ -1299,55 +1317,112 @@ bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint6
   }
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
   // Reads are served only after each 4096-byte integrity block verifies against the owner-signed
-  // policy; without a matching policy the device is never published.
-  return configureVerification ();
+  // policy; without a matching policy the device is never published. The diagnostic paths
+  // (probe 15, native-ufs-root-noverify) ask for the unverified window explicitly.
+  return !verify || configureVerification ();
 #else
   return true;
 #endif
 }
 
-#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
-volatile uint64_t native_ufs_verified_blocks = 0;
-// Time spent hashing/verifying and reading from the UFS transport, in generic-timer ticks (diagnostic only).
+// Time spent reading from the UFS transport, in generic-timer ticks (diagnostic only). The
+// read path uses these in both the verified and the plain block build.
 volatile uint64_t native_ufs_verify_ticks = 0, native_ufs_read_ticks = 0;
 static inline uint64_t timerTicks (void) {uint64_t v; __asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r" (v)); return v;}
+
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+volatile uint64_t native_ufs_verified_blocks = 0;
 volatile uint32_t native_ufs_integrity_failures = 0;
+
+// The userdata layout of this root publication, so a policy envelope can be read from the image instead of
+// being linked into the kernel. Set by NativeUfs::startRoot around the window preparation.
+static const RootLayout *gRuntimePolicyLayout = nullptr;
+
+// Read one envelope from the policy directory into `dst` (round_page(size) bytes). The directory entry is
+// not trusted; vr_open authenticates the bytes afterwards.
+static bool readRuntimePolicy (const RootPolicy &policy, uint8_t *dst)
+{
+  if (!gRuntimePolicyLayout || !dst || (policy.offset & 4095) || !policy.size) {
+    return false;
+  }
+  uint64_t lba = gRuntimePolicyLayout->userdataFirst + policy.offset / 4096;
+  uint64_t blocks = (policy.size + 4095) / 4096;
+  for (uint64_t done = 0; done < blocks;) {
+    uint32_t chunk = static_cast<uint32_t> (blocks - done > kDataMax / 4096 ? kDataMax / 4096 : blocks - done);
+    if (hostRead4k (0, lba + done, chunk, dst + done * 4096) != kIOReturnSuccess) {
+      return false;
+    }
+    done += chunk;
+  }
+  return true;
+}
 
 bool NativeUfsBlock::configureVerification ()
 {
   gRootDiagnostic.stage = "policy selection";
   gRootDiagnostic.windowBytes = bytes;
-  gRootDiagnostic.policyCount = verified_root_policy_count;
+  gRootDiagnostic.policyCount = verified_root_policy_count ? verified_root_policy_count
+                                                           : (gRuntimePolicyLayout ? gRuntimePolicyLayout->policies : 0);
   gRootDiagnostic.verify = 0xffffffff;
-  // Select the one policy whose signed image size equals this window; two matches are refused.
+  // A linked bundle is selected first (the other boards); without one, the envelope comes from the
+  // userdata policy directory and the kernel carries only the owner key.
   const uint8_t *manifest = nullptr;
+  const RootPolicy *runtime = nullptr;
   uint64_t manifestBytes = 0;
-  if (!verified_root_policy_count || verified_root_policy_count > 16) {
-    gRootDiagnostic.stage = "policy count invalid";
-    return false;
-  }
-  for (uint64_t index = 0; index < verified_root_policy_count; ++index) {
-    const NativeVerifiedBlockPolicy &policy = verified_root_policies[index];
-    if (!policy.manifest || policy.manifestBytes < VR_HEADER_BYTES + VR_SIGNATURE_BYTES) {
-      gRootDiagnostic.stage = "policy envelope invalid";
+  if (verified_root_policy_count) {
+    // Select the one policy whose signed image size equals this window; two matches are refused.
+    if (verified_root_policy_count > 16) {
+      gRootDiagnostic.stage = "policy count invalid";
       return false;
     }
-    uint64_t imageBytes = 0;
-    for (unsigned i = 0; i < 8; ++i) {
-      imageBytes |= static_cast<uint64_t> (policy.manifest[24 + i]) << (8 * i);
+    for (uint64_t index = 0; index < verified_root_policy_count; ++index) {
+      const NativeVerifiedBlockPolicy &policy = verified_root_policies[index];
+      if (!policy.manifest || policy.manifestBytes < VR_HEADER_BYTES + VR_SIGNATURE_BYTES) {
+        gRootDiagnostic.stage = "policy envelope invalid";
+        return false;
+      }
+      uint64_t imageBytes = 0;
+      for (unsigned i = 0; i < 8; ++i) {
+        imageBytes |= static_cast<uint64_t> (policy.manifest[24 + i]) << (8 * i);
+      }
+      if (imageBytes != bytes) {
+        continue;
+      }
+      if (manifest) {
+        gRootDiagnostic.stage = "duplicate capacity-matching policy";
+        return false;
+      }
+      manifest = policy.manifest;
+      manifestBytes = policy.manifestBytes;
     }
-    if (imageBytes != bytes) {
-      continue;
-    }
-    if (manifest) {
-      gRootDiagnostic.stage = "duplicate capacity-matching policy";
+    if (!manifest) {
+      gRootDiagnostic.stage = "no capacity-matching policy";
       return false;
     }
-    manifest = policy.manifest;
-    manifestBytes = policy.manifestBytes;
-  }
-  if (!manifest) {
-    gRootDiagnostic.stage = "no capacity-matching policy";
+  } else if (gRuntimePolicyLayout && gRuntimePolicyLayout->policies) {
+    // Locate this window's envelope by name; two entries with the same name are refused.
+    for (uint32_t index = 0; index < gRuntimePolicyLayout->policies; ++index) {
+      const RootPolicy &candidate = gRuntimePolicyLayout->policy[index];
+      if (strcmp (candidate.name, label)) {
+        continue;
+      }
+      if (runtime) {
+        gRootDiagnostic.stage = "duplicate runtime policy";
+        return false;
+      }
+      runtime = &candidate;
+    }
+    if (!runtime) {
+      gRootDiagnostic.stage = "no runtime policy for window";
+      return false;
+    }
+    if (runtime->size < VR_HEADER_BYTES + VR_SIGNATURE_BYTES || runtime->size > (1ULL << 31)) {
+      gRootDiagnostic.stage = "runtime policy size invalid";
+      return false;
+    }
+    manifestBytes = runtime->size;
+  } else {
+    gRootDiagnostic.stage = "no policy bundle";
     return false;
   }
   gRootDiagnostic.stage = "policy storage";
@@ -1362,7 +1437,22 @@ bool NativeUfsBlock::configureVerification ()
                   static_cast<kma_flags_t> (KMA_KOBJECT | KMA_DATA), VM_KERN_MEMORY_SECURITY) != KERN_SUCCESS) {
     return false;
   }
-  memcpy (reinterpret_cast<void *> (verifiedStorage), manifest, manifestBytes);
+  if (runtime) {
+    gRootDiagnostic.stage = "runtime policy read";
+    if (!readRuntimePolicy (*runtime, reinterpret_cast<uint8_t *> (verifiedStorage))) {
+      return false;
+    }
+    uint64_t signedBytes = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+      signedBytes |= static_cast<uint64_t> (reinterpret_cast<const uint8_t *> (verifiedStorage)[24 + i]) << (8 * i);
+    }
+    if (signedBytes != bytes) {
+      gRootDiagnostic.stage = "runtime policy capacity";
+      return false;
+    }
+  } else {
+    memcpy (reinterpret_cast<void *> (verifiedStorage), manifest, manifestBytes);
+  }
   uint8_t *key = reinterpret_cast<uint8_t *> (verifiedStorage + tableBytes);
   memcpy (key, verified_root_key, VR_KEY_BYTES);
   gRootDiagnostic.stage = "policy read-only protection";
@@ -1673,6 +1763,17 @@ static void statsThread (void *argument, wait_result_t)
          memorystatus_available_pages, max_mem, nprocs, native_ufs_block_reads);
 }
 
+// Raw userdata block test (native-ufs-probe=15): publish sda18 as a block device without the
+// owner-policy/manifest path, then show whether the prelinked storage stack read any sectors.
+static void blockTestThread (void *argument, wait_result_t)
+{
+  unsigned delay = static_cast<unsigned> (reinterpret_cast<uintptr_t> (argument));
+  IOSleep (delay * 1000);
+  panic ("NATIVE_UFS raw block test after %u s\n"
+         "userdata published=%u reads=%llu failures=%llu\n",
+         delay, native_ufs_blocks_published, native_ufs_block_reads, native_ufs_block_failures);
+}
+
 // Storage discovery report (native-ufs-probe=12): a separate thread waits for the original
 // IOStorageFamily to publish IOMedia for the root windows, then shows what exists on the screen.
 // It must not run inside the matching thread that is starting NativeUfs.
@@ -1726,21 +1827,30 @@ static void mediaReportThread (void *, wait_result_t)
   }
   panic ("%s", gMediaReport);
 }
+#endif
 
 bool NativeUfs::start (IOService *provider)
 {
-  unsigned probe = 0, rootMode = 0;
+  unsigned probe = 0, rootMode = 0, rootNoVerify = 0;
   PE_parse_boot_argn ("native-ufs-probe", &probe, sizeof (probe));
   PE_parse_boot_argn ("native-ufs-root", &rootMode, sizeof (rootMode));
+  PE_parse_boot_argn ("native-ufs-root-noverify", &rootNoVerify, sizeof (rootNoVerify));
   native_ufs_probe_requested = probe != 0;
   // Default: match for observability only, never touch the controller. Hardware work runs once,
   // from the root-device personality; the ufshc nub match stays observation-only.
-  if ((!probe && !rootMode) || !OSDynamicCast (IOPlatformExpertDevice, provider)) {
+  if ((!probe && !rootMode && !rootNoVerify) || !OSDynamicCast (IOPlatformExpertDevice, provider)) {
     return false;
   }
   unsigned diagnostic = 0;
   PE_parse_boot_argn ("native-ufs-diagnostics", &diagnostic, sizeof (diagnostic));
   gRootDiagnosticEnabled = diagnostic == 1;
+#if defined(NATIVE_UFS_PROBE_ONLY)
+  // The block device and root publication pull in IOStorageFamily/VerifiedRoot.
+  // A probe-only build keeps the controller probes and says so if asked for them.
+  if (probe == 12 || probe == 13 || rootMode || rootNoVerify) {
+    panic ("NATIVE_UFS probe-only build: block device/root publication not linked");
+  }
+#endif
   if (probe == 2) {
     inspect ();
   }
@@ -1806,6 +1916,7 @@ bool NativeUfs::start (IOService *provider)
            be32w (layout->window[0].sha256), be32w (layout->window[0].sha256 + 4), be32w (layout->window[0].sha256 + 8), be32w (layout->window[0].sha256 + 12),
            be32w (layout->window[1].sha256), be32w (layout->window[1].sha256 + 4), be32w (layout->window[1].sha256 + 8), be32w (layout->window[1].sha256 + 12));
   }
+#if !defined(NATIVE_UFS_PROBE_ONLY)
   if (probe == 14) {
     // Immediate memory snapshot at root-device start, before the userspace that triggers jetsam.
     panic ("NATIVE_UFS early memory snapshot\n"
@@ -1815,6 +1926,32 @@ bool NativeUfs::start (IOService *provider)
            vm_page_wire_count, vm_page_speculative_count, vm_page_purgeable_count,
            memorystatus_available_pages, max_mem, nprocs);
   }
+#endif
+#if defined(UFS_USERDATA_FIRST) && !defined(NATIVE_UFS_PROBE_ONLY)
+  if (probe == 15) {
+    // Raw userdata block test: publish sda18 as a block device without the owner-policy path.
+    const char *why = "";
+    if (!hostBringUp (&why)) {
+      panic ("NATIVE_UFS block test: bring-up failed: %s", why);
+    }
+    NativeUfsBlock *device = OSTypeAlloc (NativeUfsBlock);
+    if (!device || !device->init (static_cast<OSDictionary *> (nullptr)) ||
+        !device->configure ("userdata", UFS_USERDATA_FIRST * 4096ULL,
+                            (UFS_USERDATA_LAST - UFS_USERDATA_FIRST + 1) * 4096ULL, false)) {
+      panic ("NATIVE_UFS block test: configure failed");
+    }
+    if (!device->attach (this) || !device->start (this)) {
+      panic ("NATIVE_UFS block test: publish failed");
+    }
+    thread_t thread = nullptr;
+    if (kernel_thread_start (blockTestThread, reinterpret_cast<void *> (static_cast<uintptr_t> (8)), &thread) != KERN_SUCCESS) {
+      panic ("NATIVE_UFS block test: cannot start the report thread");
+    }
+    thread_deallocate (thread);
+    return true;
+  }
+#endif
+#if !defined(NATIVE_UFS_PROBE_ONLY)
   if (probe == 13) {
     unsigned delay = 12;
     PE_parse_boot_argn ("native-ufs-stats-delay", &delay, sizeof (delay));
@@ -1840,13 +1977,18 @@ bool NativeUfs::start (IOService *provider)
     thread_deallocate (thread);
     return true;
   }
+  if (rootNoVerify && !probe) {
+    return startRootUnverified (provider);
+  }
   if (rootMode && !probe) {
     return startRoot (provider);
   }
+#endif
   return false;
 }
 
 // Boot the root image's windows as block devices. Soft-fails (logs, publishes nothing).
+#if !defined(NATIVE_UFS_PROBE_ONLY)
 bool NativeUfs::startRoot (IOService *provider)
 {
   const char *why = "";
@@ -1872,6 +2014,16 @@ bool NativeUfs::startRoot (IOService *provider)
     IOFree (layout, sizeof (RootLayout));
     return false;
   }
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+  // A linked policy bundle does not need the userdata directory; the runtime path does.
+  if (!verified_root_policy_count && layout->policyStatus != 0) {
+    rootDiagnosticFailure ("root policy directory missing or rejected");
+    IOLog ("NativeUfs: policy directory status %u (0 ok, 1 none, 2 format, 3 hash, 4 bounds, 5 names, 6 overlap, 7 read)\n",
+           layout->policyStatus);
+    IOFree (layout, sizeof (RootLayout));
+    return false;
+  }
+#endif
   gStoreGeometry = { true, layout->userdataFirst, layout->userdataLast, layout->imageBytes, layout->gptEntriesLba,
                      layout->gptHeaderCrc, layout->gptEntriesCrc, layout->gptEntryCount };
   const char *names[4] = {};
@@ -1887,6 +2039,9 @@ bool NativeUfs::startRoot (IOService *provider)
     return false;
   }
   // Prepare all windows or publish none. Diagnostics never decide policy.
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+  gRuntimePolicyLayout = layout;
+#endif
   gPending = 0;
   gPendingProvider = this;
   struct Operations {
@@ -1941,6 +2096,9 @@ bool NativeUfs::startRoot (IOService *provider)
     void discard (unsigned index) { discardPendingWindow (index); }
   } operations = { this, layout };
   UfsRootPublicationResult result = ufsPrepareRootWindows (operations, layout->windows);
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+  gRuntimePolicyLayout = nullptr;
+#endif
   IOFree (layout, sizeof (RootLayout));
   if (result.phase != UfsRootPhase::Complete) {
     gPending = 0;
@@ -1956,6 +2114,56 @@ bool NativeUfs::startRoot (IOService *provider)
   }
   return true;
 }
+
+// Test path (native-ufs-root-noverify=1): publish the OS/SystemOS windows from the SHNGROOT
+// manifest without the owner-policy check. The bytes are read-only; the kernel's own APFS/Image4
+// path still validates what it mounts. This is the step before the VerifiedRoot bundle exists.
+bool NativeUfs::startRootUnverified (IOService *provider)
+{
+  const char *why = "";
+  native_ufs_root_step = 1;
+  if (!hostBringUp (&why)) {
+    rootDiagnosticFailure (why);
+    return false;
+  }
+  RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
+  if (!layout || !findRootLayout (layout, &why)) {
+    rootDiagnosticFailure (layout ? why : "root layout allocation failed");
+    if (layout) IOFree (layout, sizeof (RootLayout));
+    return false;
+  }
+  if (!IOService::start (provider)) {
+    rootDiagnosticFailure ("root IOService start failed");
+    IOFree (layout, sizeof (RootLayout));
+    return false;
+  }
+  for (uint32_t index = 0; index < layout->windows; index++) {
+    NativeUfsBlock *device = OSTypeAlloc (NativeUfsBlock);
+    uint64_t absolute = layout->userdataFirst * 4096ULL + layout->window[index].offset;
+    if (!device || !device->init (static_cast<OSDictionary *> (nullptr)) ||
+        !device->configure (layout->window[index].name, absolute, layout->window[index].size, false) ||
+        !device->attach (this) || !device->start (this)) {
+      panic ("NATIVE_UFS root-noverify: publish %s failed first=%llx off=%llx size=%llx",
+             layout->window[index].name, layout->userdataFirst, layout->window[index].offset, layout->window[index].size);
+    }
+    native_ufs_blocks_published = native_ufs_blocks_published + 1;
+    IOLog ("NativeUfs: published %s at %llx size %llx\n",
+           layout->window[index].name, absolute, layout->window[index].size);
+  }
+  gRootDiagnostic.result = kIOReturnSuccess;
+  unsigned report = 0;
+  PE_parse_boot_argn ("native-ufs-block-report", &report, sizeof (report));
+  if (report) {
+    thread_t thread = nullptr;
+    if (kernel_thread_start (blockTestThread, reinterpret_cast<void *> (static_cast<uintptr_t> (report)), &thread) != KERN_SUCCESS) {
+      panic ("NATIVE_UFS root-noverify: cannot start the block report thread");
+    }
+    thread_deallocate (thread);
+  }
+  IOFree (layout, sizeof (RootLayout));
+  return true;
+}
+#endif
 
 void NativeUfs::stop (IOService *provider)
 {

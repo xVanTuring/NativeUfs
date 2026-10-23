@@ -49,12 +49,12 @@ def prepare(out, verified_root):
     swapped = os_data[4096:8192] + os_data[:4096] + os_data[8192:]
     windows = [('OS',os_data),('SystemOS',system_data),('Corrupt',bytes(corrupt)),('Swapped',swapped)]
     header = bytearray(4096); header[:8]=b'SHNGROOT'; struct.pack_into('<II',header,8,1,len(windows))
-    cursor=4096; disk=bytearray(2*1024*1024); expected=[]
+    # The real userdata image leaves the second block for the policy directory and starts windows at 1 MiB.
+    cursor=1024*1024; disk=bytearray(2*1024*1024); expected=[]
     for index,(name,data) in enumerate(windows):
         struct.pack_into('<32sQQII32s',header,24+index*128,name.encode(),cursor,len(data),512,1,hashlib.sha256(data).digest())
         disk[8*4096+cursor:8*4096+cursor+len(data)]=data
         expected.append((cursor,len(data)));cursor+=(len(data)+4095)&~4095
-    struct.pack_into('<Q',header,16,cursor);header[4064:]=hashlib.sha256(header[:4064]).digest()
     disk[8*4096:9*4096]=header
     entries=bytearray(4096);entries[:16]=uuid.UUID('dd59ac14-13f5-4d77-801d-2e20bf564099').bytes_le
     entries[16:32]=uuid.UUID('d6ad4e45-9ddb-4cce-9827-4c3fd6b9da5a').bytes_le
@@ -65,15 +65,31 @@ def prepare(out, verified_root):
     disk[4096:8192]=gpt;disk[8192:12288]=entries
     # Separate raw transport payload, outside the synthetic windows.
     pattern=bytes((i*29+i//4096)&255 for i in range(131072));disk[384*4096:416*4096]=pattern
-    (out/'disk.raw').write_bytes(disk)
     policies=[]
     for name,data in windows[:2]:
         directory=out/('signed-'+name)
         signer.make(io.BytesIO(data),len(data),private,public,
             uuid.UUID('01e286f1-f4dd-4b2f-99d9-4973337fc788' if name=='OS' else 'db25b52a-1d3e-4bfc-b54c-360a158be156'),7,directory)
         policies.append((directory/'manifest.bin').read_bytes())
+    # Locator block at partition offset 4096 and the envelopes after the windows: the run-time path.
+    policy_layout=[]
+    for (name,_),blob in zip(windows[:2],policies):
+        offset=(cursor+4095)&~4095
+        disk[8*4096+offset:8*4096+offset+len(blob)]=blob
+        policy_layout.append((name,offset,len(blob)))
+        cursor=offset+((len(blob)+4095)&~4095)
+    locator=bytearray(4096);locator[:8]=b'SHNGPOL1'
+    struct.pack_into('<IIII',locator,8,1,len(policy_layout),88,0)
+    for index,(name,offset,size) in enumerate(policy_layout):
+        struct.pack_into('<32sQQII32s',locator,24+88*index,name.encode(),offset,size,4096,1,
+                         hashlib.sha256(policies[index]).digest())
+    locator[4064:]=hashlib.sha256(locator[:4064]).digest()
+    disk[8*4096+4096:8*4096+8192]=locator
+    struct.pack_into('<Q',header,16,cursor);header[4064:]=hashlib.sha256(header[:4064]).digest()
+    disk[8*4096:9*4096]=header
+    (out/'disk.raw').write_bytes(disk)
     return dict(pattern=pattern,windows=expected,os=os_data,system=system_data,policies=policies,
-                key=(out/'signed-OS/trusted-key.bin').read_bytes())
+                policy_layout=policy_layout,key=(out/'signed-OS/trusted-key.bin').read_bytes())
 
 
 def check(lib, fixture):
@@ -85,6 +101,13 @@ def check(lib, fixture):
     assert lib.ufs_path_layout()==0, 'Production GPT/manifest parser failed'
     for i,(offset,size) in enumerate(fixture['windows']):
         assert lib.ufs_path_window(i,0)==offset and lib.ufs_path_window(i,1)==size
+    lib.ufs_path_policy_status.restype=C.c_uint32
+    lib.ufs_path_policy_count.restype=C.c_uint32
+    lib.ufs_path_policy.argtypes=[C.c_uint,C.c_uint];lib.ufs_path_policy.restype=C.c_uint64
+    assert lib.ufs_path_policy_status()==0, 'Policy directory parser failed'
+    assert lib.ufs_path_policy_count()==len(fixture['policy_layout'])
+    for i,(name,offset,size) in enumerate(fixture['policy_layout']):
+        assert lib.ufs_path_policy(i,0)==offset and lib.ufs_path_policy(i,1)==size
     def opened(index,policy=0,envelope=None,key=None,expected=0):
         blob=fixture['policies'][policy] if envelope is None else envelope
         assert lib.ufs_path_open(index,blob,len(blob),fixture['key'] if key is None else key)==expected
@@ -109,6 +132,6 @@ def check(lib, fixture):
     opened(0,key=bytes(key),expected=2)
     opened(1,policy=0,expected=0x101)  # authentic policy for a different capacity
     opened(0,envelope=b'',expected=1)
-    return {'gpt_manifest':'pass','rsa3072_owner_policy':'pass','window_512_4k_128k_tail':'pass',
+    return {'gpt_manifest':'pass','policy_directory':'pass','rsa3072_owner_policy':'pass','window_512_4k_128k_tail':'pass',
             'late_corruption_partial_progress':'pass','swapped_blocks_no_copy':'pass',
             'bad_signature_hash_table_anchor_capacity_unsigned':'pass'}

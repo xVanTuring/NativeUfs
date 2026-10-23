@@ -27,6 +27,12 @@ uint64_t ufs_path_window(unsigned index,unsigned field) {
   if(index>=layout.windows) return 0;
   return field==0 ? layout.window[index].offset : layout.window[index].size;
 }
+uint32_t ufs_path_policy_status() { return layout.policyStatus; }
+uint32_t ufs_path_policy_count() { return layout.policies; }
+uint64_t ufs_path_policy(unsigned index,unsigned field) {
+  if(index>=layout.policies) return 0;
+  return field==0 ? layout.policy[index].offset : field==1 ? layout.policy[index].size : 0;
+}
 uint32_t ufs_path_open(unsigned index,const uint8_t *manifest,size_t bytes,const uint8_t *key) {
   verified={}; envelope.clear();
   if(layout.manifestStatus || index>=layout.windows) return 0x100;
