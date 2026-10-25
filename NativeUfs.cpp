@@ -1362,6 +1362,35 @@ volatile uint64_t native_ufs_block_reads = 0;
 volatile uint64_t native_ufs_block_failures = 0;
 }
 
+// Who reads (diagnostic, BootRamoops.c's "ufs readers" row): the calling process of each request by name, with its requests and 512-byte
+// blocks. A request runs in the thread that asked for it (a page-in in the faulting thread), so this names the process behind the
+// reading. pipa read about 3500 requests a second from boot to the end of a round (2026-10-25), and an app's first start waits behind them.
+struct NativeUfsReader {char name[20]; uint64_t requests, blocks;};
+extern "C" struct NativeUfsReader native_ufs_readers[12];
+struct NativeUfsReader native_ufs_readers[12];
+extern "C" void proc_selfname (char *buf, int size);
+static void noteReader (uint64_t blocks)
+{
+  char name[20] = {};
+  proc_selfname (name, sizeof (name));
+  NativeUfsReader *slot = nullptr;
+  for (auto &entry : native_ufs_readers) {
+    if (!entry.name[0]) {
+      if (!slot) slot = &entry;
+      break;
+    }
+    if (!strncmp (entry.name, name, sizeof (entry.name))) {slot = &entry; break;}
+  }
+  if (!slot) {   // the table is full: the last entry becomes the rest together
+    slot = &native_ufs_readers[11];
+    strlcpy (slot->name, "(others)", sizeof (slot->name));
+  } else if (!slot->name[0]) {
+    strlcpy (slot->name, name, sizeof (slot->name));
+  }
+  slot->requests++;
+  slot->blocks += blocks;
+}
+
 static char gRootDiagnosticText[2500];
 static char gRootMediaText[1000];
 // Passive diagnostic reader: cached software values only. It must remain safe
@@ -1681,6 +1710,9 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     , &verified
 #endif
   };
+  IOLockLock (windowLock);
+  noteReader (count);
+  IOLockUnlock (windowLock);
   UfsWindowResult outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounce);
   IOReturn result = outcome.status;
   uint64_t done = outcome.done;
